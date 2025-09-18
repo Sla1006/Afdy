@@ -1,110 +1,152 @@
-name: Windows RDP (detailed, with optional ngrok)
+name: Windows RDP via Tailscale
 
 on:
   workflow_dispatch:
 
 jobs:
-  enable-rdp:
+  rdp-via-tailscale:
     runs-on: windows-latest
     env:
       RDP_USER: Afdy22
       RDP_PASS: SquadLA22
-      # Jika mau gunakan ngrok, tambahkan secret NGROK_AUTHTOKEN di Settings -> Secrets
-      # NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+      TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+      TAILSCALE_HOSTNAME: "gh-runner-afdy-${{ github.run_id }}"
     steps:
       - name: Info runner
-        run: |
-          Write-Host "RUNNER: $($env:RUNNER_OS) - $($env:RUNNER_NAME)"
-          ipconfig /all
         shell: pwsh
+        run: |
+          Write-Host "Runner OS: $env:RUNNER_OS"
+          Write-Host "Run ID: $env:GITHUB_RUN_ID"
 
-      - name: Aktifkan RDP & service
+      - name: Install Chocolatey (if missing) & Tailscale
+        shell: pwsh
+        run: |
+          # Ensure we have choco (windows-latest usually has it but ensure)
+          if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
+            Write-Host "Installing Chocolatey..."
+            Set-ExecutionPolicy Bypass -Scope Process -Force
+            iex ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))
+          } else {
+            Write-Host "Chocolatey already present."
+          }
+
+          Write-Host "Installing Tailscale..."
+          choco install tailscale -y --no-progress
+          Write-Host "Tailscale install done."
+
+      - name: Start tailscaled service (if not auto-started)
+        shell: pwsh
+        run: |
+          # Try to start service name 'tailscaled' or 'Tailscale' depending on package
+          $svc = Get-Service -Name tailscaled -ErrorAction SilentlyContinue
+          if (-not $svc) { $svc = Get-Service -Name Tailscale -ErrorAction SilentlyContinue }
+          if ($svc) {
+            Write-Host "Starting service $($svc.Name)"
+            Start-Service -Name $svc.Name -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 3
+            Get-Service -Name $svc.Name | Format-Table -AutoSize
+          } else {
+            Write-Host "Service not found; attempting to start tailscaled executable directly..."
+            $path1 = "C:\Program Files\Tailscale IPN\tailscaled.exe"
+            if (Test-Path $path1) {
+              Start-Process -FilePath $path1 -ArgumentList "--state=c:\tailscaled.state" -WindowStyle Hidden
+              Start-Sleep -Seconds 3
+            } else {
+              Write-Error "Tidak menemukan tailscaled executable. Install mungkin gagal."
+            }
+          }
+
+      - name: Up Tailscale (authenticate with authkey)
+        shell: pwsh
+        run: |
+          if (-not $env:TAILSCALE_AUTHKEY) {
+            Write-Error "TAILSCALE_AUTHKEY tidak ditemukan. Set secret TAILSCALE_AUTHKEY di repo Settings -> Secrets."
+            exit 1
+          }
+          # Find tailscale binary
+          $ts = Get-Command tailscale -ErrorAction SilentlyContinue
+          if (-not $ts) {
+            $possible = "C:\Program Files\Tailscale IPN\tailscale.exe"
+            if (Test-Path $possible) { $ts = $possible } else { Write-Error "tailscale CLI tidak ditemukan."; exit 1 }
+          } else { $ts = $ts.Path }
+
+          Write-Host "Menjalankan: tailscale up --authkey=<secret> --hostname=$env:TAILSCALE_HOSTNAME --accept-routes --accept-dns"
+          # Use --authkey to join network automatically. Avoid printing the authkey.
+          & $ts up --authkey=$env:TAILSCALE_AUTHKEY --hostname=$env:TAILSCALE_HOSTNAME --accept-routes --accept-dns
+          Start-Sleep -Seconds 3
+          Write-Host "Tailscale status:"
+          & $ts status || Write-Host "Tidak dapat menjalankan tailscale status."
+
+      - name: Get Tailscale IP & status
+        shell: pwsh
+        run: |
+          $ts = (Get-Command tailscale -ErrorAction SilentlyContinue).Path
+          try {
+            $ipv4 = & $ts ip -4
+            Write-Host "Tailscale IPv4: $ipv4"
+          } catch {
+            Write-Host "Gagal membaca IP tailscale. Cek 'tailscale status'."
+            & $ts status
+          }
+
+      - name: Enable RDP & open firewall
+        shell: pwsh
         run: |
           Write-Host "Mengaktifkan RDP..."
-          # Enable RDP
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
-          # Pastikan Network Level Authentication diset (1 = enabled)
           Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 1
-          # Pastikan TermService berjalan
           Start-Service -Name TermService -ErrorAction SilentlyContinue
-          # Open firewall (DisplayGroup ada di Windows Server/Client)
+
           try {
             Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           } catch {
-            Write-Host "Enable-NetFirewallRule gagal, mencoba rule-by-rule fallback..."
+            Write-Host "Fallback membuat rule firewall untuk 3389..."
             New-NetFirewallRule -DisplayName "Accept-RDP-3389" -Direction Inbound -LocalPort 3389 -Protocol TCP -Action Allow
           }
           Write-Host "RDP enabled."
-        shell: pwsh
 
-      - name: Buat user RDP & tambahkan ke Administrators
+      - name: Create RDP user and add to Administrators
+        shell: pwsh
         run: |
           $u = $env:RDP_USER
           $p = $env:RDP_PASS
           Write-Host "Membuat user: $u"
-          # Jika New-LocalUser tersedia, gunakan itu; fallback ke Net User
           try {
             $secure = ConvertTo-SecureString $p -AsPlainText -Force
+            # Delete if exists (avoid error)
+            if (Get-LocalUser -Name $u -ErrorAction SilentlyContinue) {
+              Write-Host "User sudah ada, mencoba hapus lalu buat ulang..."
+              Remove-LocalUser -Name $u -ErrorAction SilentlyContinue
+            }
             New-LocalUser -Name $u -Password $secure -FullName $u -Description "Temporary RDP user created by GitHub Action" -ErrorAction Stop
             Add-LocalGroupMember -Group "Administrators" -Member $u
             Write-Host "User dibuat via New-LocalUser."
           } catch {
-            Write-Host "New-LocalUser gagal atau tidak tersedia, fallback ke net user"
+            Write-Host "New-LocalUser gagal, fallback net user"
             net user $u $p /add
             net localgroup administrators $u /add
-            Write-Host "User dibuat via net user."
           }
-          # Force password never expires (opsional)
+          Write-Host "Set password never expires (optional)"
           try { wmic UserAccount where Name='$u' set PasswordExpires=False } catch {}
-          Write-Host "Selesai membuat user."
-        shell: pwsh
+          Write-Host "User siap."
 
-      - name: Tampilkan kredensial (HATI-HATI: log akan menyimpan ini)
-        run: |
-          Write-Host "=== CREDENTIALS ==="
-          Write-Host "Hostname / IP (may be internal):"
-          ipconfig | Select-String -Pattern "IPv4"
-          Write-Host "Username: $env:RDP_USER"
-          Write-Host "Password: $env:RDP_PASS"
-          Write-Host "==================="
+      - name: Show connection info (DO NOT share logs publicly)
         shell: pwsh
+        run: |
+          $ts = (Get-Command tailscale -ErrorAction SilentlyContinue).Path
+          Write-Host "=== CONNECTION INFO ==="
+          try { $ip = & $ts ip -4 } catch { $ip = "(unknown)" }
+          Write-Host "Tailscale IPv4: $ip"
+          Write-Host "Hostname: $env:TAILSCALE_HOSTNAME"
+          Write-Host "RDP Username: $env:RDP_USER"
+          Write-Host "RDP Password: (hidden for safety in logs)"
+          Write-Host "======================="
+          Write-Host ""
+          Write-Host "Untuk terhubung: pada device yang juga di Tailscale -> Remote Desktop ke $ip (port 3389)."
 
-      - name: (Optional) Install and run ngrok to expose RDP temporarily
-        if: ${{ secrets.NGROK_AUTHTOKEN != '' }}
-        run: |
-          Write-Host "Mengunduh ngrok..."
-          $zip = "$env:GITHUB_WORKSPACE\ngrok.zip"
-          Invoke-WebRequest -Uri "https://bin.equinox.io/c/4VmDzA7iaHb/ngrok-stable-windows-amd64.zip" -OutFile $zip
-          Expand-Archive -Path $zip -DestinationPath $env:GITHUB_WORKSPACE -Force
-          $ngrokexe = Join-Path $env:GITHUB_WORKSPACE "ngrok.exe"
-          Write-Host "Register authtoken (from secret)"
-          & $ngrokexe authtoken $env:NGROK_AUTHTOKEN
-          Write-Host "Menjalankan ngrok TCP tunnel untuk port 3389..."
-          Start-Process -FilePath $ngrokexe -ArgumentList "tcp 3389 --region=ap" -WindowStyle Hidden
-          # Tunggu tunnel muncul di http://127.0.0.1:4040/api/tunnels
-          $tries = 0
-          do {
-            Start-Sleep -Seconds 1
-            try {
-              $t = Invoke-RestMethod -Uri http://127.0.0.1:4040/api/tunnels -ErrorAction Stop
-            } catch { $t = $null }
-            $tries++
-          } while (($t -eq $null) -and ($tries -lt 30))
-          if ($t -ne $null) {
-            $tcp = $t.tunnels | Where-Object { $_.proto -eq 'tcp' } | Select-Object -First 1
-            if ($tcp) {
-              Write-Host "Ngrok public address: $($tcp.public_url)"
-              Write-Host "Gunakan host dari public_url (mis. tcp://0.tcp.ngrok.io:12345) -> RDP ke host:port"
-            } else { Write-Host "Tidak menemukan tunnel tcp. Cek ngrok logs." }
-          } else {
-            Write-Host "Ngrok tidak berhasil start dalam batas waktu."
-          }
+      - name: Keep job alive briefly to allow RDP session (optional)
+        if: ${{ always() }}
         shell: pwsh
-
-      - name: Keep job alive (optional, untuk memberi waktu remote)
-        if: ${{ secrets.NGROK_AUTHTOKEN != '' }}
         run: |
-          # Job akan tetap hidup selama langkah ini berjalan. Batasi durasi.
-          Write-Host "Menjaga job hidup selama 25 menit (agar kamu sempat connect)."
-          Start-Sleep -Seconds 1500
-        shell: pwsh
+          Write-Host "Menjaga job hidup 10 menit agar kamu sempat connect. Job akan tetap berhenti sesuai limit GitHub runner."
+          Start-Sleep -Seconds 600
