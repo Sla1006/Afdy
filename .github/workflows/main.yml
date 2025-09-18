@@ -1,152 +1,53 @@
-name: Windows RDP via Tailscale
+name: Windows RDP via Tailscale (portable)
 
 on:
   workflow_dispatch:
 
 jobs:
-  rdp-via-tailscale:
+  rdp:
     runs-on: windows-latest
     env:
       RDP_USER: Afdy22
       RDP_PASS: SquadLA22
       TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-      TAILSCALE_HOSTNAME: "gh-runner-afdy-${{ github.run_id }}"
     steps:
-      - name: Info runner
+      - name: Download Tailscale portable
         shell: pwsh
         run: |
-          Write-Host "Runner OS: $env:RUNNER_OS"
-          Write-Host "Run ID: $env:GITHUB_RUN_ID"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-ipn-setup-latest.exe" -OutFile tailscale.exe
 
-      - name: Install Chocolatey (if missing) & Tailscale
+      - name: Start tailscaled in userspace
         shell: pwsh
         run: |
-          # Ensure we have choco (windows-latest usually has it but ensure)
-          if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
-            Write-Host "Installing Chocolatey..."
-            Set-ExecutionPolicy Bypass -Scope Process -Force
-            iex ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))
-          } else {
-            Write-Host "Chocolatey already present."
-          }
+          Start-Process -FilePath .\tailscale.exe -ArgumentList "serve" -WindowStyle Hidden
+          Start-Sleep -Seconds 5
 
-          Write-Host "Installing Tailscale..."
-          choco install tailscale -y --no-progress
-          Write-Host "Tailscale install done."
-
-      - name: Start tailscaled service (if not auto-started)
+      - name: Tailscale up
         shell: pwsh
         run: |
-          # Try to start service name 'tailscaled' or 'Tailscale' depending on package
-          $svc = Get-Service -Name tailscaled -ErrorAction SilentlyContinue
-          if (-not $svc) { $svc = Get-Service -Name Tailscale -ErrorAction SilentlyContinue }
-          if ($svc) {
-            Write-Host "Starting service $($svc.Name)"
-            Start-Service -Name $svc.Name -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 3
-            Get-Service -Name $svc.Name | Format-Table -AutoSize
-          } else {
-            Write-Host "Service not found; attempting to start tailscaled executable directly..."
-            $path1 = "C:\Program Files\Tailscale IPN\tailscaled.exe"
-            if (Test-Path $path1) {
-              Start-Process -FilePath $path1 -ArgumentList "--state=c:\tailscaled.state" -WindowStyle Hidden
-              Start-Sleep -Seconds 3
-            } else {
-              Write-Error "Tidak menemukan tailscaled executable. Install mungkin gagal."
-            }
-          }
+          .\tailscale.exe up --authkey $env:TAILSCALE_AUTHKEY --hostname github-runner --accept-routes --accept-dns
 
-      - name: Up Tailscale (authenticate with authkey)
+      - name: Get Tailscale IP
         shell: pwsh
         run: |
-          if (-not $env:TAILSCALE_AUTHKEY) {
-            Write-Error "TAILSCALE_AUTHKEY tidak ditemukan. Set secret TAILSCALE_AUTHKEY di repo Settings -> Secrets."
-            exit 1
-          }
-          # Find tailscale binary
-          $ts = Get-Command tailscale -ErrorAction SilentlyContinue
-          if (-not $ts) {
-            $possible = "C:\Program Files\Tailscale IPN\tailscale.exe"
-            if (Test-Path $possible) { $ts = $possible } else { Write-Error "tailscale CLI tidak ditemukan."; exit 1 }
-          } else { $ts = $ts.Path }
+          .\tailscale.exe ip -4
 
-          Write-Host "Menjalankan: tailscale up --authkey=<secret> --hostname=$env:TAILSCALE_HOSTNAME --accept-routes --accept-dns"
-          # Use --authkey to join network automatically. Avoid printing the authkey.
-          & $ts up --authkey=$env:TAILSCALE_AUTHKEY --hostname=$env:TAILSCALE_HOSTNAME --accept-routes --accept-dns
-          Start-Sleep -Seconds 3
-          Write-Host "Tailscale status:"
-          & $ts status || Write-Host "Tidak dapat menjalankan tailscale status."
-
-      - name: Get Tailscale IP & status
+      - name: Enable RDP
         shell: pwsh
         run: |
-          $ts = (Get-Command tailscale -ErrorAction SilentlyContinue).Path
-          try {
-            $ipv4 = & $ts ip -4
-            Write-Host "Tailscale IPv4: $ipv4"
-          } catch {
-            Write-Host "Gagal membaca IP tailscale. Cek 'tailscale status'."
-            & $ts status
-          }
-
-      - name: Enable RDP & open firewall
-        shell: pwsh
-        run: |
-          Write-Host "Mengaktifkan RDP..."
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
-          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 1
-          Start-Service -Name TermService -ErrorAction SilentlyContinue
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+          net user $env:RDP_USER $env:RDP_PASS /add
+          net localgroup administrators $env:RDP_USER /add
 
-          try {
-            Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          } catch {
-            Write-Host "Fallback membuat rule firewall untuk 3389..."
-            New-NetFirewallRule -DisplayName "Accept-RDP-3389" -Direction Inbound -LocalPort 3389 -Protocol TCP -Action Allow
-          }
-          Write-Host "RDP enabled."
-
-      - name: Create RDP user and add to Administrators
+      - name: Show connection info
         shell: pwsh
         run: |
-          $u = $env:RDP_USER
-          $p = $env:RDP_PASS
-          Write-Host "Membuat user: $u"
-          try {
-            $secure = ConvertTo-SecureString $p -AsPlainText -Force
-            # Delete if exists (avoid error)
-            if (Get-LocalUser -Name $u -ErrorAction SilentlyContinue) {
-              Write-Host "User sudah ada, mencoba hapus lalu buat ulang..."
-              Remove-LocalUser -Name $u -ErrorAction SilentlyContinue
-            }
-            New-LocalUser -Name $u -Password $secure -FullName $u -Description "Temporary RDP user created by GitHub Action" -ErrorAction Stop
-            Add-LocalGroupMember -Group "Administrators" -Member $u
-            Write-Host "User dibuat via New-LocalUser."
-          } catch {
-            Write-Host "New-LocalUser gagal, fallback net user"
-            net user $u $p /add
-            net localgroup administrators $u /add
-          }
-          Write-Host "Set password never expires (optional)"
-          try { wmic UserAccount where Name='$u' set PasswordExpires=False } catch {}
-          Write-Host "User siap."
+          $ip = .\tailscale.exe ip -4
+          Write-Host "Connect RDP ke: $ip"
+          Write-Host "User: $env:RDP_USER"
+          Write-Host "Pass: $env:RDP_PASS"
 
-      - name: Show connection info (DO NOT share logs publicly)
+      - name: Keep alive
         shell: pwsh
-        run: |
-          $ts = (Get-Command tailscale -ErrorAction SilentlyContinue).Path
-          Write-Host "=== CONNECTION INFO ==="
-          try { $ip = & $ts ip -4 } catch { $ip = "(unknown)" }
-          Write-Host "Tailscale IPv4: $ip"
-          Write-Host "Hostname: $env:TAILSCALE_HOSTNAME"
-          Write-Host "RDP Username: $env:RDP_USER"
-          Write-Host "RDP Password: (hidden for safety in logs)"
-          Write-Host "======================="
-          Write-Host ""
-          Write-Host "Untuk terhubung: pada device yang juga di Tailscale -> Remote Desktop ke $ip (port 3389)."
-
-      - name: Keep job alive briefly to allow RDP session (optional)
-        if: ${{ always() }}
-        shell: pwsh
-        run: |
-          Write-Host "Menjaga job hidup 10 menit agar kamu sempat connect. Job akan tetap berhenti sesuai limit GitHub runner."
-          Start-Sleep -Seconds 600
+        run: Start-Sleep -Seconds 900
