@@ -1,0 +1,110 @@
+name: Windows RDP (detailed, with optional ngrok)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  enable-rdp:
+    runs-on: windows-latest
+    env:
+      RDP_USER: Afdy22
+      RDP_PASS: SquadLA22
+      # Jika mau gunakan ngrok, tambahkan secret NGROK_AUTHTOKEN di Settings -> Secrets
+      # NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+    steps:
+      - name: Info runner
+        run: |
+          Write-Host "RUNNER: $($env:RUNNER_OS) - $($env:RUNNER_NAME)"
+          ipconfig /all
+        shell: pwsh
+
+      - name: Aktifkan RDP & service
+        run: |
+          Write-Host "Mengaktifkan RDP..."
+          # Enable RDP
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
+          # Pastikan Network Level Authentication diset (1 = enabled)
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 1
+          # Pastikan TermService berjalan
+          Start-Service -Name TermService -ErrorAction SilentlyContinue
+          # Open firewall (DisplayGroup ada di Windows Server/Client)
+          try {
+            Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          } catch {
+            Write-Host "Enable-NetFirewallRule gagal, mencoba rule-by-rule fallback..."
+            New-NetFirewallRule -DisplayName "Accept-RDP-3389" -Direction Inbound -LocalPort 3389 -Protocol TCP -Action Allow
+          }
+          Write-Host "RDP enabled."
+        shell: pwsh
+
+      - name: Buat user RDP & tambahkan ke Administrators
+        run: |
+          $u = $env:RDP_USER
+          $p = $env:RDP_PASS
+          Write-Host "Membuat user: $u"
+          # Jika New-LocalUser tersedia, gunakan itu; fallback ke Net User
+          try {
+            $secure = ConvertTo-SecureString $p -AsPlainText -Force
+            New-LocalUser -Name $u -Password $secure -FullName $u -Description "Temporary RDP user created by GitHub Action" -ErrorAction Stop
+            Add-LocalGroupMember -Group "Administrators" -Member $u
+            Write-Host "User dibuat via New-LocalUser."
+          } catch {
+            Write-Host "New-LocalUser gagal atau tidak tersedia, fallback ke net user"
+            net user $u $p /add
+            net localgroup administrators $u /add
+            Write-Host "User dibuat via net user."
+          }
+          # Force password never expires (opsional)
+          try { wmic UserAccount where Name='$u' set PasswordExpires=False } catch {}
+          Write-Host "Selesai membuat user."
+        shell: pwsh
+
+      - name: Tampilkan kredensial (HATI-HATI: log akan menyimpan ini)
+        run: |
+          Write-Host "=== CREDENTIALS ==="
+          Write-Host "Hostname / IP (may be internal):"
+          ipconfig | Select-String -Pattern "IPv4"
+          Write-Host "Username: $env:RDP_USER"
+          Write-Host "Password: $env:RDP_PASS"
+          Write-Host "==================="
+        shell: pwsh
+
+      - name: (Optional) Install and run ngrok to expose RDP temporarily
+        if: ${{ secrets.NGROK_AUTHTOKEN != '' }}
+        run: |
+          Write-Host "Mengunduh ngrok..."
+          $zip = "$env:GITHUB_WORKSPACE\ngrok.zip"
+          Invoke-WebRequest -Uri "https://bin.equinox.io/c/4VmDzA7iaHb/ngrok-stable-windows-amd64.zip" -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $env:GITHUB_WORKSPACE -Force
+          $ngrokexe = Join-Path $env:GITHUB_WORKSPACE "ngrok.exe"
+          Write-Host "Register authtoken (from secret)"
+          & $ngrokexe authtoken $env:NGROK_AUTHTOKEN
+          Write-Host "Menjalankan ngrok TCP tunnel untuk port 3389..."
+          Start-Process -FilePath $ngrokexe -ArgumentList "tcp 3389 --region=ap" -WindowStyle Hidden
+          # Tunggu tunnel muncul di http://127.0.0.1:4040/api/tunnels
+          $tries = 0
+          do {
+            Start-Sleep -Seconds 1
+            try {
+              $t = Invoke-RestMethod -Uri http://127.0.0.1:4040/api/tunnels -ErrorAction Stop
+            } catch { $t = $null }
+            $tries++
+          } while (($t -eq $null) -and ($tries -lt 30))
+          if ($t -ne $null) {
+            $tcp = $t.tunnels | Where-Object { $_.proto -eq 'tcp' } | Select-Object -First 1
+            if ($tcp) {
+              Write-Host "Ngrok public address: $($tcp.public_url)"
+              Write-Host "Gunakan host dari public_url (mis. tcp://0.tcp.ngrok.io:12345) -> RDP ke host:port"
+            } else { Write-Host "Tidak menemukan tunnel tcp. Cek ngrok logs." }
+          } else {
+            Write-Host "Ngrok tidak berhasil start dalam batas waktu."
+          }
+        shell: pwsh
+
+      - name: Keep job alive (optional, untuk memberi waktu remote)
+        if: ${{ secrets.NGROK_AUTHTOKEN != '' }}
+        run: |
+          # Job akan tetap hidup selama langkah ini berjalan. Batasi durasi.
+          Write-Host "Menjaga job hidup selama 25 menit (agar kamu sempat connect)."
+          Start-Sleep -Seconds 1500
+        shell: pwsh
